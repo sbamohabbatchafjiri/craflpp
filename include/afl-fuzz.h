@@ -152,6 +152,9 @@ extern s16 interesting_16[INTERESTING_8_LEN + INTERESTING_16_LEN];
 extern s32
     interesting_32[INTERESTING_8_LEN + INTERESTING_16_LEN + INTERESTING_32_LEN];
 
+/* Code I have added*/
+#define PCG_MULTIPLIER 6364136223846793005ULL
+#define PCG_INCREMENT 1442695040888963407ULL
 struct tainted {
 
   u32             pos;
@@ -490,7 +493,9 @@ typedef struct afl_state {
 
   /* Position of this state in the global states list */
   u32 _id;
-
+  u64 rand_state;   // PCG state
+  u64 rand_seed[2]; // Seed from /dev/urandom or other entropy source
+  
   afl_forkserver_t fsrv;
   sharedmem_t      shm;
   sharedmem_t     *shm_fuzz;
@@ -1316,36 +1321,36 @@ void plot_profile_data(afl_state_t *, struct queue_entry *);
 /* Generate a random number (from 0 to limit - 1). This may
    have slight bias. */
 
-static inline u32 rand_below(afl_state_t *afl, u32 limit) {
+/* PCG implementation for rand_next(afl) */
+static inline u64 rand_next(afl_state_t *afl) {
+    u64 oldstate = afl->rand_state;
+    afl->rand_state = oldstate * PCG_MULTIPLIER + PCG_INCREMENT;  // Advance the state
 
-  if (unlikely(limit <= 1)) return 0;
-
-  /* The boundary not being necessarily a power of 2,
-     we need to ensure the result uniformity. */
-  if (unlikely(!afl->rand_cnt--) && likely(!afl->fixed_seed)) {
-
-    ck_read(afl->fsrv.dev_urandom_fd, &afl->rand_seed, sizeof(afl->rand_seed),
-            "/dev/urandom");
-    // srandom(afl->rand_seed[0]);
-    afl->rand_cnt = (RESEED_RNG / 2) + (afl->rand_seed[1] % RESEED_RNG);
-
-  }
-
-  /* Modulo is biased - we don't want our fuzzing to be biased so let's do it
-   right. See:
-   https://stackoverflow.com/questions/10984974/why-do-people-say-there-is-modulo-bias-when-using-a-random-number-generator
-   */
-  u64 unbiased_rnd;
-  do {
-
-    unbiased_rnd = rand_next(afl);
-
-  } while (unlikely(unbiased_rnd >= (UINT64_MAX - (UINT64_MAX % limit))));
-
-  return unbiased_rnd % limit;
-
+    // Apply the permuted output function (PCG RXS-M-XS)
+    u64 xorshifted = ((oldstate >> 18u) ^ oldstate) >> 27u;
+    u64 rot = oldstate >> 59u;
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
 }
 
+/* Existing rand_below function, but using the PCG version of rand_next */
+static inline u32 rand_below(afl_state_t *afl, u32 limit) {
+    if (unlikely(limit <= 1)) return 0;
+
+    /* The boundary not being necessarily a power of 2, we need to ensure uniformity */
+    if (unlikely(!afl->rand_cnt--) && likely(!afl->fixed_seed)) {
+        ck_read(afl->fsrv.dev_urandom_fd, &afl->rand_seed, sizeof(afl->rand_seed), "/dev/urandom");
+        afl->rand_cnt = (RESEED_RNG / 2) + (afl->rand_seed[1] % RESEED_RNG);
+        afl->rand_state = afl->rand_seed[0];  // Initialize PCG state with the seed
+    }
+
+    /* Modulo bias avoidance */
+    u64 unbiased_rnd;
+    do {
+        unbiased_rnd = rand_next(afl);
+    } while (unlikely(unbiased_rnd >= (UINT64_MAX - (UINT64_MAX % limit))));
+
+    return unbiased_rnd % limit;
+}
 /* we prefer lower range values here */
 /* this is only called with normal havoc, not MOpt, to have an equalizer for
    expand havoc mode */
